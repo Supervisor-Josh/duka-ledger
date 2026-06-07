@@ -103,3 +103,20 @@ async def scan_receipt(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini processing engine failure: {str(e)}")
+# --- Add this to the very bottom of your existing main.py ---
+
+from reconciliation import reconcile_transactions
+from database import get_db
+from sqlalchemy.orm import Session
+from fastapi import Depends, HTTPException
+
+@app.post("/api/reconcile")
+def run_reconciliation(time_window: int = 15, db: Session = Depends(get_db)):
+    """
+    Triggers the dual-engine reconciliation matching logic manually from the UI.
+    """
+    try:
+        result = reconcile_transactions(db, time_window_minutes=time_window)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reconciliation failed: {str(e)}")
