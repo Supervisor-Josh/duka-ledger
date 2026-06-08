@@ -120,3 +120,65 @@ def run_reconciliation(time_window: int = 15, db: Session = Depends(get_db)):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reconciliation failed: {str(e)}")
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+from fastapi import Depends
+from database import get_db
+from sqlalchemy.orm import Session
+import models
+
+# --- 1. PYDANTIC SCHEMAS FOR VALIDATION ---
+class SMSCreate(BaseModel):
+    transaction_id: str
+    sender: str
+    amount: float
+    timestamp: Optional[datetime] = None
+
+class ReceiptCreate(BaseModel):
+    total_amount: float
+    timestamp: Optional[datetime] = None
+
+
+# --- 2. ENDPOINTS TO SAVE THE DATA ---
+
+@app.post("/api/sms/save")
+def save_sms_transaction(sms_data: SMSCreate, db: Session = Depends(get_db)):
+    """
+    Receives parsed M-Pesa SMS data and saves it straight to the database.
+    """
+    # Check if transaction already exists to avoid duplicates
+    existing = db.query(models.SMSTransaction).filter(
+        models.SMSTransaction.transaction_id == sms_data.transaction_id
+    ).first()
+    
+    if existing:
+        return {"status": "error", "message": f"Transaction {sms_data.transaction_id} already exists"}
+
+    new_sms = models.SMSTransaction(
+        transaction_id=sms_data.transaction_id,
+        sender=sms_data.sender,
+        amount=sms_data.amount,
+        timestamp=sms_data.timestamp or datetime.utcnow()
+    )
+    
+    db.add(new_sms)
+    db.commit()
+    db.refresh(new_sms)
+    return {"status": "success", "message": "SMS saved successfully", "id": new_sms.id}
+
+
+@app.post("/api/receipt/save")
+def save_receipt_transaction(receipt_data: ReceiptCreate, db: Session = Depends(get_db)):
+    """
+    Receives extracted receipt data (from Gemini OCR) and saves it to the database.
+    """
+    new_receipt = models.ReceiptTransaction(
+        total_amount=receipt_data.total_amount,
+        timestamp=receipt_data.timestamp or datetime.utcnow()
+    )
+    
+    db.add(new_receipt)
+    db.commit()
+    db.refresh(new_receipt)
+    return {"status": "success", "message": "Receipt saved successfully", "id": new_receipt.id}
