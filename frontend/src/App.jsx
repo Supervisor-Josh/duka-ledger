@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 
 export default function App() {
   const [smsText, setSmsText] = useState('');
@@ -6,7 +6,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  // Engine 1: Handle SMS Parsing Form Submission
+  // Engine 1: Handle M-Pesa SMS Submission
   const handleSmsSubmit = async (e) => {
     e.preventDefault();
     if (!smsText.trim()) return;
@@ -14,165 +14,161 @@ export default function App() {
     setError('');
 
     try {
-      const formData = new FormData();
-      formData.append('raw_text', smsText);
-
-      const response = await fetch('/api/parse-sms', {
+      const response = await fetch('http://localhost:8000/api/parse-sms', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_text: smsText }),
       });
 
-      if (!response.ok) throw new Error('Failed to parse SMS statement');
-      
-      const data = await response.json();
-      setLedger((prev) => [data, ...prev]);
-      setSmsText(''); // Clear input on success
+      const res = await response.json();
+
+      if (!res || !res.data) {
+        throw new Error(res?.message || 'Could not parse this SMS format');
+      }
+
+      setLedger((prev) => [res.data, ...prev]);
+      setSmsText('');
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Error parsing transaction');
     } finally {
       setLoading(false);
     }
   };
 
-  // Engine 2: Handle Photo-to-Text Receipt Upload
+  // Engine 2: Handle Receipt Image Scan
   const handleReceiptUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+
     setLoading(true);
     setError('');
 
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
+    const formData = new FormData();
+    formData.append('file', file);
 
-      const response = await fetch('/api/scan-receipt', {
+    try {
+      const response = await fetch('http://localhost:8000/api/scan-receipt', {
         method: 'POST',
         body: formData,
       });
 
-      if (!response.ok) throw new Error('Failed to process receipt image');
+      const res = await response.json();
 
-      const data = await response.json();
-      setLedger((prev) => [data, ...prev]);
+      if (res.status !== 'success') {
+        throw new Error('Failed to process receipt image');
+      }
+
+      // If backend returns parsed receipt data, push to ledger, otherwise record scan event
+      const scannedEntry = res.parsed_expense || {
+        transaction_id: `REC-${Date.now().toString().slice(-4)}`,
+        amount: 0.0,
+        sender: `Receipt Image (${res.filename})`,
+        type: 'EXPENSE',
+        raw: `Scanned file: ${res.filename}`,
+      };
+
+      setLedger((prev) => [scannedEntry, ...prev]);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Error uploading receipt');
     } finally {
       setLoading(false);
+      e.target.value = ''; // Reset input selection
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#0B0B0C] text-gray-100 p-4 md:p-8 font-sans">
-      <div className="max-w-5xl mx-auto space-y-8">
-        
-        <header className="flex justify-between items-center border-b border-gray-800 pb-4">
-          <div>
-            <h1 className="text-2xl font-extrabold text-white tracking-tight">Duka<span className="text-emerald-500">POS</span></h1>
-            <p className="text-xs text-gray-400">Automated Financial Ledger Engine</p>
-          </div>
-          <span className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs font-mono px-3 py-1 rounded-full">
-            🟢 Local Engine Connected
-          </span>
-        </header>
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-8 font-sans">
+      <div className="max-w-2xl mx-auto bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl">
+        <h1 className="text-2xl font-bold text-cyan-400 mb-1">DukaPOS</h1>
+        <p className="text-xs text-slate-400 mb-6">Automated Financial Ledger Engine</p>
 
         {error && (
-          <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-3 rounded-lg text-sm">
-            ⚠️ Error: {error}
+          <div className="mb-4 p-3 bg-red-900/40 border border-red-500/50 rounded text-red-300 text-sm">
+            ⚠️ {error}
           </div>
         )}
 
-        <div className="grid md:grid-cols-2 gap-6">
-          
-          <div className="bg-[#161B22] border border-gray-800 p-6 rounded-xl space-y-4">
-            <h2 className="text-sm font-mono text-sky-400 font-bold uppercase tracking-wider">Engine 1: SMS Parser Hook</h2>
-            <form onSubmit={handleSmsSubmit} className="space-y-3">
-              <label className="block text-xs text-gray-400 font-medium">Paste Raw M-PESA Confirmation Text:</label>
-              <textarea
-                value={smsText}
-                onChange={(e) => setSmsText(e.target.value)}
-                placeholder="e.g., KQA41B7G8D Confirmed. You have received Ksh2,500.00 from JOSHUA KIOKO..."
-                className="w-full h-24 bg-[#0D1117] border border-gray-800 rounded-lg p-3 text-xs text-gray-300 focus:outline-none focus:border-sky-500 transition font-mono"
-              />
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full bg-sky-600 hover:bg-sky-500 disabled:bg-gray-800 text-white font-semibold text-xs py-2.5 rounded-lg transition"
-              >
-                {loading ? 'Processing Input...' : 'Parse Transaction Text'}
-              </button>
-            </form>
-          </div>
+        {/* ENGINE 1: SMS PARSER */}
+        <form onSubmit={handleSmsSubmit} className="mb-6">
+          <label className="block text-sm font-medium text-cyan-300 mb-2">
+            ENGINE 1: SMS PARSER HOOK
+          </label>
+          <textarea
+            value={smsText}
+            onChange={(e) => setSmsText(e.target.value)}
+            placeholder="Paste Raw M-PESA Confirmation Text..."
+            className="w-full h-28 p-3 bg-slate-950 border border-slate-800 rounded-lg text-sm focus:outline-none focus:border-cyan-500 text-slate-200"
+          />
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full mt-3 py-3 bg-cyan-600 hover:bg-cyan-500 font-semibold rounded-lg transition-colors text-white disabled:opacity-50"
+          >
+            {loading ? 'Parsing...' : 'Parse Transaction Text'}
+          </button>
+        </form>
 
-          <div className="bg-[#161B22] border border-gray-800 p-6 rounded-xl flex flex-col justify-between">
-            <div>
-              <h2 className="text-sm font-mono text-emerald-400 font-bold uppercase tracking-wider mb-4">Engine 2: Receipt OCR Vision</h2>
-              <p className="text-xs text-gray-400 mb-4 leading-relaxed">
-                Upload or drop a picture of a physical market receipt. The Gemini 2.5 Flash pipeline will extract the business name, items, and total amount automatically.
-              </p>
-            </div>
-            <div className="relative border-2 border-dashed border-gray-800 rounded-lg p-6 text-center hover:border-emerald-500/40 transition">
-              <input
-                type="file"
-                accept="image/*"
-                onChange={handleReceiptUpload}
-                disabled={loading}
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-              />
-              <div className="space-y-1 text-xs">
-                <span className="text-2xl">📸</span>
-                <p className="text-gray-300 font-medium">Click to select receipt image</p>
-                <p className="text-gray-500 text-[11px]">Supports PNG, JPG, WebP</p>
-              </div>
-            </div>
-          </div>
+        <hr className="border-slate-800 my-6" />
 
+        {/* ENGINE 2: RECEIPT OCR UPLOADER */}
+        <div className="mb-6">
+          <label className="block text-sm font-medium text-cyan-300 mb-2">
+            ENGINE 2: RECEIPT IMAGE SCANNER
+          </label>
+          <input
+            type="file"
+            accept="image/*"
+            onChange={handleReceiptUpload}
+            disabled={loading}
+            className="block w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-slate-800 file:text-cyan-400 hover:file:bg-slate-700 cursor-pointer disabled:opacity-50"
+          />
         </div>
 
-        <div className="space-y-4">
-          <h2 className="text-lg font-bold text-white tracking-tight">Unified Ledger Operations</h2>
-          
-          <div className="bg-[#161B22] border border-gray-800 rounded-xl overflow-hidden">
-            {ledger.length === 0 ? (
-              <div className="p-8 text-center text-xs text-gray-500 font-mono">
-                No active statement instances registered in local memory ledger feed.
-              </div>
-            ) : (
-              <div className="divide-y divide-gray-800">
-                {ledger.map((item, idx) => (
-                  <div key={idx} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 text-xs font-mono">
-                    <div className="flex items-center space-x-3">
-                      <span className={`text-lg p-2 rounded-lg ${item.flow_type === 'income' ? 'bg-emerald-500/10' : 'bg-red-500/10'}`}>
-                        {item.flow_type === 'income' ? '📥' : '📤'}
-                      </span>
-                      <div>
-                        <div className="font-bold text-white text-sm">{item.party_name}</div>
-                        <div className="text-[11px] text-gray-400">
-                          ID: <span className="text-gray-300">{item.transaction_id}</span> &middot; Source: <span className="text-gray-300">{item.source}</span>
-                        </div>
-                        {item.items_detected && item.items_detected.length > 0 && (
-                          <div className="mt-1 flex gap-1 flex-wrap">
-                            {item.items_detected.map((tag, i) => (
-                              <span key={i} className="bg-gray-800 text-gray-400 text-[10px] px-1.5 py-0.5 rounded">
-                                {tag}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    <div className="text-right sm:border-none border-t border-gray-800/50 pt-2 sm:pt-0">
-                      <div className={`text-sm font-bold ${item.flow_type === 'income' ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {item.flow_type === 'income' ? '+' : '-'} Ksh {item.amount.toLocaleString(undefined, {minimumFractionDigits: 2})}
-                      </div>
-                      <div className="text-[10px] text-gray-500">{new Date(item.timestamp).toLocaleTimeString()}</div>
-                    </div>
+        {/* RECONCILED / PARSED LEDGER LIST */}
+        <div className="mt-8">
+          <h3 className="text-sm font-semibold text-slate-400 mb-3 uppercase tracking-wider">
+            Transaction Ledger ({ledger.length})
+          </h3>
+
+          <div className="space-y-3">
+            {ledger.map((item, idx) => {
+              const isIncome = item.type === 'INCOME';
+              return (
+                <div
+                  key={idx}
+                  className="p-4 bg-slate-950 rounded-lg border border-slate-800 flex justify-between items-center"
+                >
+                  <div>
+                    <p className="font-mono text-sm text-cyan-400 font-bold">
+                      {item.transaction_id || item.id || 'N/A'}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-1">
+                      {item.sender || item.raw || 'Parsed Record'}
+                    </p>
                   </div>
-                ))}
-              </div>
-            )}
+                  <div className="text-right">
+                    <p
+                      className={`font-bold ${
+                        isIncome ? 'text-emerald-400' : 'text-rose-400'
+                      }`}
+                    >
+                      {isIncome ? '+' : '-'}Ksh {item.amount ? item.amount.toLocaleString() : '0.00'}
+                    </p>
+                    <span
+                      className={`text-[10px] px-2 py-0.5 rounded border ${
+                        isIncome
+                          ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                          : 'bg-rose-950 text-rose-300 border-rose-800'
+                      }`}
+                    >
+                      {item.type || 'EXPENSE'}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
-
       </div>
     </div>
   );

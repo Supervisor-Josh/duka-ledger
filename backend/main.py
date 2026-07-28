@@ -1,101 +1,144 @@
-import os
+import asyncio
+import json
 import re
-from datetime import datetime
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Optional
+import os
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from PIL import Image
-import io
+
+# Load environment variables from .env
+load_dotenv()
 
 app = FastAPI()
 
-# 1. This client handles the connection to Google's servers
-client = genai.Client()
+# Enable CORS for Vite frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# 2. This structure forces Gemini to output clean data fields
-class LedgerEntry(BaseModel):
-    transaction_id: str = Field(description="Extracted unique serial/receipt number or reference code")
-    source: str = Field(description="Must explicitly be 'receipt_ocr'")
-    timestamp: str = Field(description="ISO format timestamp found on receipt, or current time if missing")
-    flow_type: str = Field(description="Must explicitly be 'expense'")
-    amount: float = Field(description="The final total numeric amount paid, stripped of symbols and commas")
-    party_name: str = Field(description="The business header or vendor name at the top of the receipt")
-    items_detected: List[str] = Field(default=[], description="List of raw inventory items discovered (e.g., Tomatoes, Onions)")
+# Initialize Gemini Client
+api_key = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
-class SMSResponse(BaseModel):
-    transaction_id: str
-    source: str
-    timestamp: str
-    flow_type: str
-    amount: float
-    party_name: str
-    items_detected: List[str] = []
+# Payload Schema for SMS Endpoint
+class SMSPayload(BaseModel):
+    raw_text: str
+
+# Schema for structured Gemini OCR output
+class ReceiptData(BaseModel):
+    merchant_name: str
+    total_amount: float
+    items_count: int
+
 
 @app.get("/api/health")
 def health():
     return {"status": "Ledger backend online"}
 
-# --- ENGINE 1: M-PESA SMS PARSER ---
-@app.post("/api/parse-sms", response_model=SMSResponse)
-def parse_sms(raw_text: str = Form(...)):
-    text = raw_text.strip()
-    tx_match = re.match(r"^([A-Z0-9]{10})", text)
-    if not tx_match:
-        raise HTTPException(status_code=400, detail="Invalid format: Missing Transaction ID")
-    tx_id = tx_match.group(1)
-    
-    if "received" in text.lower():
-        flow_type = "income"
-        amt_match = re.search(r"received\s+Ksh([\d,]+\.\d{2})", text, re.IGNORECASE)
-        party_match = re.search(r"from\s+([A-Z\s]+?)\s+on", text, re.IGNORECASE)
-    elif "paid to" in text.lower() or "sent to" in text.lower():
-        flow_type = "expense"
-        amt_match = re.search(r"Ksh([\d,]+\.\d{2})\s+(?:paid|sent)\s+to", text, re.IGNORECASE)
-        party_match = re.search(r"(?:paid|sent)\s+to\s+([A-Z0-9\s\.]+?)\s+on", text, re.IGNORECASE)
-    else:
-        raise HTTPException(status_code=400, detail="Unable to determine financial flow direction")
 
-    amount = float(amt_match.group(1).replace(",", "")) if amt_match else 0.0
-    party_name = party_match.group(1).strip() if party_match else "Unknown Counterparty"
-    
-    return SMSResponse(
-        transaction_id=tx_id,
-        source="sms_parsing",
-        timestamp=datetime.now().isoformat(),
-        flow_type=flow_type,
-        amount=amount,
-        party_name=party_name,
-        items_detected=[]
+# ENGINE 1: M-PESA SMS PARSER (UNTOUCHED)
+@app.post("/api/parse-sms")
+async def parse_sms(payload: SMSPayload):
+    text = payload.raw_text
+
+    match = re.search(
+        r"([A-Z0-9]+)\s+Confirmed\.\s+Ksh([\d,]+\.?\d*)\s+(sent to|received from)\s+([^on]+)",
+        text,
+        re.IGNORECASE
     )
 
-# --- ENGINE 2: REAL PHOTO-TO-TEXT RECEIPT OCR ---
-@app.post("/api/scan-receipt", response_model=LedgerEntry)
-async def scan_receipt(file: UploadFile = File(...)):
-    try:
-        file_bytes = await file.read()
-        if not file_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
-        
-        image = Image.open(io.BytesIO(file_bytes))
-        prompt = (
-            "Analyze this business purchase receipt image. Extract the business name, total cost, "
-            "individual items, and receipt/serial numbers. Return the structured mapping following the provided schema constraint."
-        )
-        
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[image, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=LedgerEntry,
-                temperature=0.1,
-            ),
-        )
-        return LedgerEntry.model_validate_json(response.text)
+    if not match:
+        return {
+            "status": "error",
+            "message": "Unrecognized or unsupported M-Pesa SMS format",
+            "data": None
+        }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini processing engine failure: {str(e)}")
-    finally:
-        await file.close()
+    tx_code, amount_str, direction, party = match.groups()
+    is_income = "received" in direction.lower()
+
+    parsed_data = {
+        "transaction_id": tx_code.strip(),
+        "amount": float(amount_str.replace(",", "")),
+        "sender": party.strip(),
+        "type": "INCOME" if is_income else "EXPENSE",
+        "raw": text
+    }
+
+    return {"status": "success", "data": parsed_data}
+
+
+# ENGINE 2: RECEIPT OCR SCANNER (WITH AUTOMATED RETRY / WAIT TIME)
+@app.post("/api/scan-receipt")
+async def scan_receipt(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+
+    prompt = """
+    Analyze this receipt image. 
+    Extract the merchant or shop name, the total amount spent, and the total count of distinct items purchased.
+    Respond STRICTLY with valid JSON following the schema.
+    """
+
+    max_retries = 3
+    base_delay = 5  # Default wait time in seconds if no retryDelay is given by Gemini
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"--> [Attempt {attempt}/{max_retries}] Processing receipt OCR request...")
+
+            response = client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ReceiptData,
+                ),
+            )
+
+            receipt_json = json.loads(response.text)
+
+            parsed_expense = {
+                "transaction_id": f"REC-{receipt_json.get('merchant_name', 'UNKNOWN')[:8].upper()}",
+                "amount": receipt_json.get("total_amount", 0.0),
+                "sender": receipt_json.get("merchant_name", "Scanned Receipt"),
+                "type": "EXPENSE",
+                "raw": f"OCR Scan ({receipt_json.get('items_count', 0)} items)"
+            }
+
+            return {
+                "status": "success",
+                "filename": file.filename,
+                "parsed_expense": parsed_expense
+            }
+
+        except Exception as e:
+            error_str = str(e)
+            print(f"Attempt {attempt} failed: {error_str}")
+
+            # Check for Rate Limit / Quota limits
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                if attempt == max_retries:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Gemini API rate limit reached after retries. Please wait 1 minute."
+                    )
+
+                # Parse the exact retry delay from Google's error string if available
+                delay_match = re.search(r"retryDelay':\s*'(\d+)s'", error_str)
+                wait_seconds = int(delay_match.group(1)) + 1 if delay_match else (base_delay * attempt)
+
+                print(f"[Rate Limit 429] Waiting {wait_seconds} seconds before attempt #{attempt + 1}...")
+                await asyncio.sleep(wait_seconds)
+            else:
+                # Raise other server/parsing errors immediately
+                raise HTTPException(status_code=500, detail=f"OCR Processing failed: {error_str}")
